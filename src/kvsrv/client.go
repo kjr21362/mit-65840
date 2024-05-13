@@ -37,7 +37,19 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	id := nrand()
+	args := GetArgs{key, id, false}
+	reply := GetReply{}
+	for !ck.server.Call("KVServer.Get", &args, &reply) {
+
+	}
+
+	args = GetArgs{key, id, true}
+	for !ck.server.Call("KVServer.Get", &args, &reply) {
+
+	}
+	
+	return reply.Value
 }
 
 // shared by Put and Append.
@@ -50,7 +62,19 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
 	// You will have to modify this function.
-	return ""
+	id := nrand()
+	args := PutAppendArgs{key, value, op, id, false}
+	reply := PutAppendReply{}
+	for !ck.server.Call("KVServer." + op, &args, &reply) {
+
+	}
+
+	args = PutAppendArgs{key, value, op, id, true}
+	for !ck.server.Call("KVServer." + op, &args, &reply) {
+
+	}
+	
+	return reply.Value
 }
 
 func (ck *Clerk) Put(key string, value string) {
