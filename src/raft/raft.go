@@ -81,11 +81,10 @@ type Raft struct {
 	identity    int
 	nextIndex   []int
 	matchIndex  []int
-	//electionTimeout int64
-	//lastElectionStart time.Time
 	lastHeartBeat time.Time
 	heartBeatTimeout int64
 	votesReceived int
+	applyCh     chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -183,6 +182,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	Ack     int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -198,16 +198,60 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(dLeader, "S%d is follower", rf.me)
 		rf.identity = FOLLOWER
 	}
-
-	logOK := true
+	
+	logOK := (len(rf.log) >= args.PrevLogIndex) && (rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm)
+	Debug(dLog2, "S%d len(rf.log): %d, args.PrevLogIndex %d, logOK %t", rf.me , len(rf.log) , args.PrevLogIndex, logOK)
+	
 	if args.LeaderTerm == rf.currentTerm && logOK {
+		
+		suffix := args.Entries
+		Debug(dLog2, "S%d got suffix, length %d from leaderId %d", rf.me, len(suffix), args.LeaderId)
+		if len(suffix) > 0 && len(rf.log) > args.PrevLogIndex {
+			index := len(rf.log) - 1
+			if args.PrevLogIndex + len(suffix) - 1 < index {
+				index = args.PrevLogIndex + len(suffix) - 1
+			}
+			if rf.log[index].Term != suffix[index - args.PrevLogIndex].Term {
+				Debug(dLog2, "S%d rf.log[%d].Term %d != suffix[%d].Term %d", rf.me, index, rf.log[index].Term, index - args.PrevLogIndex, suffix[index - args.PrevLogIndex].Term)
+				rf.log = rf.log[:args.PrevLogIndex]
+			}
+		}
+		if args.PrevLogIndex + len(suffix) > len(rf.log) {
+			Debug(dLog2, "S%d appending log from suffix[%d:]", rf.me, len(rf.log) - args.PrevLogIndex)
+			toAppend := suffix[len(rf.log) - args.PrevLogIndex:]
+			rf.log = append(rf.log, toAppend...)
+		}
+		//if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit > rf.lastApplied {
+			// deliver msg to application
+			rf.commitIndex = args.LeaderCommit
+			go rf.applyLogs()
+		}
+
 		reply.Term = rf.currentTerm
 		reply.Success = true
+		reply.Ack = args.PrevLogIndex + len(suffix)
+
+		rf.debugPrintLog()
+
 	} else {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.Ack = 0
 	}
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) applyLogs() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for i := rf.lastApplied; i < rf.commitIndex; i++ {
+		Debug(dCommit, "S%d deliver log[%d] to applyCh", rf.me, i)
+		msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+		rf.applyCh <- msg
+	}
+
+	rf.lastApplied = rf.commitIndex
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -220,9 +264,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.lastHeartBeat = time.Now()
 	Debug(dLog2, "S%d respond to RequestVote from S%d", rf.me, args.CandidateId)
 	if args.CandidateTerm > rf.currentTerm {
-		Debug(dLeader, "S%d receive more up-to-date RequestVote, change to follower", rf.me)
+		Debug(dLeader, "S%d change to follower because CandidateTerm %d > currentTerm %d", rf.me, args.CandidateTerm, rf.currentTerm)
 		rf.currentTerm = args.CandidateTerm
 		rf.identity = FOLLOWER
 		rf.votedFor = -1
@@ -230,14 +275,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	lastTerm := rf.log[len(rf.log)-1].Term
-	logOK := (args.CandidateTerm > lastTerm) || (args.CandidateTerm == lastTerm && args.LastLogIndex >= len(rf.log))
+	logOK := (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= len(rf.log)-1)
 	
 	if rf.currentTerm == args.CandidateTerm && logOK && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		rf.votedFor = args.CandidateId
 		//rf.lastHeartBeat = time.Now()
+		Debug(dLog2, "S%d grant vote to %d, term %d, votedFor %d", rf.me, args.CandidateId , rf.currentTerm, rf.votedFor)
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 	} else {
+		Debug(dLog2, "S%d not grant vote to %d, currentTerm %d, candidateTerm %d, logOK %t, votedFor %d", rf.me, args.CandidateId, rf.currentTerm, args.CandidateTerm, logOK, rf.votedFor)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 	}
@@ -294,9 +341,33 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	Debug(dClient, "S%d start got command %v, currentTerm %d", rf.me, command, rf.currentTerm)
+	if rf.identity != LEADER {
+		Debug(dClient, "S%d not a leader return", rf.me)
+		rf.mu.Unlock()
+		return index, term, false
+	}
 
+	newEntry := Entry{Command: command, Term: rf.currentTerm}
+	rf.log = append(rf.log, newEntry)
+	rf.matchIndex[rf.me] = len(rf.log)
+	rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
+	index = len(rf.log) - 1
+	term = rf.currentTerm
+	rf.debugPrintLog()
+	rf.mu.Unlock()
+
+	//go rf.sendHeartBeat()
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) debugPrintLog() {
+	//Debug(dCommit, "S%d log length %d", rf.me, len(rf.log))
+	for i := 0; i < len(rf.log); i++ {
+		Debug(dCommit, "S%d log[%d] command %v term %d", rf.me, i, rf.log[i].Command , rf.log[i].Term)
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -335,7 +406,7 @@ func (rf *Raft) startElection() {
 	args := RequestVoteArgs{
 		rf.currentTerm,
 		rf.me, 
-		len(rf.log), 
+		len(rf.log) - 1, 
 		rf.log[len(rf.log)-1].Term }
 
 	rf.mu.Unlock()
@@ -375,10 +446,77 @@ func (rf *Raft) startElection() {
 					Debug(dVote, "S%d become leader", rf.me)
 					rf.identity = LEADER
 					rf.heartBeatTimeout = 200
+
+					for i := 0; i < len(rf.peers); i++ {
+						if rf.me != i {
+							rf.nextIndex[i] = len(rf.log)
+							rf.matchIndex[i] = 1
+							go rf.sendHeartBeatTo(i)
+						}
+					}
 				}
 			}(i)
 		}
 	}
+}
+
+func (rf *Raft) sendHeartBeatTo(follower int) {
+	rf.mu.Lock()
+	if rf.identity != LEADER {
+		Debug(dLeader, "S%d not a leader, cannot send heartbeat to S%d", rf.me, follower)
+		rf.mu.Unlock()
+		return
+	}
+	if rf.me == follower {
+		Debug(dLeader, "S%d cannot send heartbeat to itself", rf.me)
+		rf.mu.Unlock()
+		return
+	}
+	rf.lastHeartBeat = time.Now()
+	//rf.mu.Unlock()
+
+	//Debug(dLeader, "S%d sending heartbeat to S%d", rf.me, follower)
+	prefixLen := rf.nextIndex[follower]
+	args := AppendEntriesArgs{
+		rf.currentTerm, 
+		rf.me, 
+		prefixLen, 
+		rf.log[prefixLen-1].Term, 
+		rf.log[prefixLen:], 
+		rf.commitIndex}
+	
+	rf.mu.Unlock()
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(follower, &args, &reply)
+	if !ok {
+		return
+	}
+	
+	rf.mu.Lock()
+	if reply.Term == rf.currentTerm && rf.identity == LEADER {
+		//ack := len(rf.log)
+		Debug(dLeader, "S%d currentTerm: %d, reply.Success: %t, ack: %d, rf.matchIndex[%d]: %d", rf.me, rf.currentTerm, reply.Success, reply.Ack, follower, rf.matchIndex[follower])
+		if reply.Success && reply.Ack >= rf.matchIndex[follower] {
+			rf.nextIndex[follower] = reply.Ack
+			rf.matchIndex[follower] = reply.Ack
+			// commit log
+			go rf.commitLogEntries()
+		} else if rf.nextIndex[follower] > 0 {
+			Debug(dLeader, "S%d rf.nextIndex[%d]: %d, try sending heartbeat again", rf.me, follower, rf.nextIndex[follower])
+			rf.nextIndex[follower] --
+			go rf.sendHeartBeatTo(follower)
+		}
+	} else if reply.Term > rf.currentTerm {
+		Debug(dLeader, "S%d got higher term %d when sending heartbeat, change to follower", rf.me, reply.Term)
+		rf.currentTerm = reply.Term
+		rf.identity = FOLLOWER
+		rf.votedFor = -1
+		rf.heartBeatTimeout = 200
+		rf.lastHeartBeat = time.Now()
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendHeartBeat() {
@@ -389,42 +527,48 @@ func (rf *Raft) sendHeartBeat() {
 		return
 	}
 	rf.lastHeartBeat = time.Now()
-
-	args := AppendEntriesArgs{
-		rf.currentTerm, 
-		rf.me, 
-		len(rf.log), 
-		rf.log[len(rf.log)-1].Term, 
-		[]Entry{}, 
-		rf.commitIndex}
+	Debug(dLeader, "S%d sending heartbeat", rf.me)
+	rf.debugPrintLog()
 	rf.mu.Unlock()
 	
 	for i := 0; i < len(rf.peers); i++ {
 		if rf.me != i {
-			go func(i int) {
-				Debug(dLeader, "S%d sending heartbeat to %d", rf.me, i)
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(i, &args, &reply)
-				if !ok {
-					return
-				}
-				
-				rf.mu.Lock()
-				if reply.Term == rf.currentTerm && rf.identity == LEADER {
-
-				} else if reply.Term > rf.currentTerm {
-					Debug(dLeader, "S%d got higher term %d when sending heartbeat, change to follower", rf.me, reply.Term)
-					rf.currentTerm = reply.Term
-					rf.identity = FOLLOWER
-					rf.votedFor = -1
-					rf.heartBeatTimeout = 200
-					rf.lastHeartBeat = time.Now()
-					rf.mu.Unlock()
-					return
-				}
-				rf.mu.Unlock()
-			}(i)
+			go rf.sendHeartBeatTo(i)
 		}
+	}
+}
+
+func (rf *Raft) acksCount(length int) int {
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	count := 0
+	for i := 0; i < len(rf.peers); i++ {
+		if rf.matchIndex[i] >= length {
+			count ++
+		}
+	}
+	return count
+}
+
+func (rf *Raft) commitLogEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debug(dCommit, "S%d commitLogEntries, rf.log length %d", rf.me, len(rf.log))
+	minAcks := len(rf.peers)/2 + 1
+	ready := 0
+	for leng := 1; leng <= len(rf.log); leng++ {
+		ct := rf.acksCount(leng)
+		Debug(dCommit, "S%d length: %d, acksCount: %d", rf.me, leng, ct)
+		if ct >= minAcks {
+			ready = leng
+		}
+	}
+	if ready > 0 && ready > rf.commitIndex && rf.log[ready-1].Term == rf.currentTerm {
+		Debug(dCommit, "S%d commitEntries ready %d, rf.commitIndex %d, rf.log[%d].Term %d, currentTerm %d", rf.me, ready, rf.commitIndex, ready-1 , rf.log[ready-1].Term, rf.currentTerm)
+		// deliver log msg to application
+		Debug(dCommit, "S%d deliver message, ready %d", rf.me, ready)
+		rf.commitIndex = ready
+		go rf.applyLogs()
 	}
 }
 
@@ -452,7 +596,7 @@ func (rf *Raft) ticker() {
 			}
 		}
 		
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		time.Sleep(time.Duration(50) * time.Millisecond)
 	}
 }
 
@@ -479,6 +623,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.log = append(rf.log, Entry{Term: 0})
 	rf.heartBeatTimeout = 200
+	rf.applyCh = applyCh
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = 1
+	}
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
