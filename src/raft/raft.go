@@ -19,15 +19,16 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
-
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -111,13 +112,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	state := w.Bytes()
+	rf.persister.Save(state, nil)
 }
 
 
@@ -127,18 +128,20 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term, votedFor int
+	log := make([]Entry, 0)
+
+	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		Debug(dError, "S%d readPersist error", rf.me)
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 
@@ -183,6 +186,10 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	Ack     int
+
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -193,13 +200,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderTerm > rf.currentTerm {
 		rf.currentTerm = args.LeaderTerm
 		rf.votedFor = -1
+		rf.persist()
 	}
 	if args.LeaderTerm == rf.currentTerm {
 		Debug(dLeader, "S%d is follower", rf.me)
 		rf.identity = FOLLOWER
 	}
 	
-	logOK := (len(rf.log) >= args.PrevLogIndex) && (rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm)
+	logOK := (len(rf.log) >= args.PrevLogIndex) && (args.PrevLogIndex == 0 || rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm)
 	Debug(dLog2, "S%d len(rf.log): %d, args.PrevLogIndex %d, logOK %t", rf.me , len(rf.log) , args.PrevLogIndex, logOK)
 	
 	if args.LeaderTerm == rf.currentTerm && logOK {
@@ -214,12 +222,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[index].Term != suffix[index - args.PrevLogIndex].Term {
 				Debug(dLog2, "S%d rf.log[%d].Term %d != suffix[%d].Term %d", rf.me, index, rf.log[index].Term, index - args.PrevLogIndex, suffix[index - args.PrevLogIndex].Term)
 				rf.log = rf.log[:args.PrevLogIndex]
+				rf.persist()
 			}
 		}
 		if args.PrevLogIndex + len(suffix) > len(rf.log) {
 			Debug(dLog2, "S%d appending log from suffix[%d:]", rf.me, len(rf.log) - args.PrevLogIndex)
 			toAppend := suffix[len(rf.log) - args.PrevLogIndex:]
 			rf.log = append(rf.log, toAppend...)
+			rf.persist()
 		}
 		//if args.LeaderCommit > rf.commitIndex {
 		if args.LeaderCommit > rf.lastApplied {
@@ -238,6 +248,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		reply.Ack = 0
+
+		reply.XTerm = -1
+		if len(rf.log) < args.PrevLogIndex {
+			reply.XIndex = len(rf.log)
+			reply.XTerm = -1
+		} else if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+			reply.XTerm = rf.log[args.PrevLogIndex-1].Term
+			i := args.PrevLogIndex - 1
+			for i >= 0 && rf.log[i].Term == reply.XTerm {
+				i --
+			}
+			reply.XIndex = i
+		}
 	}
 	rf.mu.Unlock()
 }
@@ -272,6 +295,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.identity = FOLLOWER
 		rf.votedFor = -1
 		rf.votesReceived = 0
+		rf.persist()
 	}
 
 	lastTerm := rf.log[len(rf.log)-1].Term
@@ -283,10 +307,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		Debug(dLog2, "S%d grant vote to %d, term %d, votedFor %d", rf.me, args.CandidateId , rf.currentTerm, rf.votedFor)
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
+		rf.persist()
 	} else {
 		Debug(dLog2, "S%d not grant vote to %d, currentTerm %d, candidateTerm %d, logOK %t, votedFor %d", rf.me, args.CandidateId, rf.currentTerm, args.CandidateTerm, logOK, rf.votedFor)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		rf.persist()
 	}
 }
 
@@ -356,6 +382,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 	rf.debugPrintLog()
+	rf.persist()
 	rf.mu.Unlock()
 
 	//go rf.sendHeartBeat()
@@ -401,6 +428,7 @@ func (rf *Raft) startElection() {
 	rf.votesReceived = 1
 	rf.lastHeartBeat = time.Now()
 	rf.heartBeatTimeout = 250 + (rand.Int63() % 300)
+	rf.persist()
 	Debug(dVote, "S%d start election with Timeout %d", rf.me, rf.heartBeatTimeout)
 
 	args := RequestVoteArgs{
@@ -430,6 +458,7 @@ func (rf *Raft) startElection() {
 					rf.identity = FOLLOWER
 					rf.heartBeatTimeout = 200
 					rf.lastHeartBeat = time.Now()
+					rf.persist()
 					return
 				}
 				if reply.VoteGranted {
@@ -475,13 +504,17 @@ func (rf *Raft) sendHeartBeatTo(follower int) {
 	rf.lastHeartBeat = time.Now()
 	//rf.mu.Unlock()
 
-	//Debug(dLeader, "S%d sending heartbeat to S%d", rf.me, follower)
 	prefixLen := rf.nextIndex[follower]
+	prefixTerm := 0
+	if prefixLen > 0 {
+		prefixTerm = rf.log[prefixLen-1].Term
+	}
+	Debug(dLeader, "S%d sending heartbeat to S%d, prefixLen %d", rf.me, follower, prefixLen)
 	args := AppendEntriesArgs{
 		rf.currentTerm, 
 		rf.me, 
-		prefixLen, 
-		rf.log[prefixLen-1].Term, 
+		prefixLen,
+		prefixTerm,
 		rf.log[prefixLen:], 
 		rf.commitIndex}
 	
@@ -503,8 +536,13 @@ func (rf *Raft) sendHeartBeatTo(follower int) {
 			go rf.commitLogEntries()
 		} else if rf.nextIndex[follower] > 0 {
 			Debug(dLeader, "S%d rf.nextIndex[%d]: %d, try sending heartbeat again", rf.me, follower, rf.nextIndex[follower])
-			rf.nextIndex[follower] --
-			go rf.sendHeartBeatTo(follower)
+			//rf.nextIndex[follower] --
+			//if reply.XTerm == -1 {
+				rf.nextIndex[follower] = reply.XIndex
+			//} else {
+
+			//}
+			//go rf.sendHeartBeatTo(follower)
 		}
 	} else if reply.Term > rf.currentTerm {
 		Debug(dLeader, "S%d got higher term %d when sending heartbeat, change to follower", rf.me, reply.Term)
@@ -513,6 +551,7 @@ func (rf *Raft) sendHeartBeatTo(follower int) {
 		rf.votedFor = -1
 		rf.heartBeatTimeout = 200
 		rf.lastHeartBeat = time.Now()
+		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
