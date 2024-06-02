@@ -62,6 +62,8 @@ type Entry struct {
 	Term    int
 }
 
+const HEARTBEAT_INTERVAL = 30 * time.Millisecond
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -635,7 +637,7 @@ func (rf *Raft) ticker() {
 			}
 		}
 		
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		time.Sleep(HEARTBEAT_INTERVAL)
 	}
 }
 
