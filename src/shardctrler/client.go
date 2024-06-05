@@ -12,6 +12,8 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	clientID  int64
+	requestID int64
 }
 
 func nrand() int64 {
@@ -25,12 +27,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clientID = nrand()
+	ck.requestID = 0
+
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
+	args.ClientID = ck.clientID
+	args.RequestID = ck.requestID
+	ck.requestID ++
 	args.Num = num
 	for {
 		// try each known server.
@@ -49,6 +57,9 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
+	args.ClientID = ck.clientID
+	args.RequestID = ck.requestID
+	ck.requestID ++
 
 	for {
 		// try each known server.
@@ -67,6 +78,9 @@ func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
+	args.ClientID = ck.clientID
+	args.RequestID = ck.requestID
+	ck.requestID ++
 
 	for {
 		// try each known server.
@@ -86,6 +100,9 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
+	args.ClientID = ck.clientID
+	args.RequestID = ck.requestID
+	ck.requestID ++
 
 	for {
 		// try each known server.
