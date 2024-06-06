@@ -11,7 +11,7 @@ import "6.5840/shardctrler"
 
 const SERVER_WAIT_INTERVAL = 10 * time.Millisecond
 const APPLY_INTERVAL = 5 * time.Millisecond
-const CONFIG_FETCH_INTERVAL = 5 * time.Millisecond
+const CONFIG_FETCH_INTERVAL = 50 * time.Millisecond
 
 type Op struct {
 	// Your definitions here.
@@ -76,7 +76,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	shard := key2shard(args.Key)
+	kv.mu.Lock()
 	gid := kv.config.Shards[shard]
+	kv.mu.Unlock()
 	if gid != args.GID {
 		reply.Err = ErrWrongGroup
 		return
@@ -113,7 +115,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	shard := key2shard(args.Key)
+	kv.mu.Lock()
 	gid := kv.config.Shards[shard]
+	kv.mu.Unlock()
 	if gid != args.GID {
 		reply.Err = ErrWrongGroup
 		return
@@ -161,7 +165,9 @@ func (kv *ShardKV) applier() {
 
 func (kv *ShardKV) configFetcher() {
 	for {
+		kv.mu.Lock()
 		kv.config = kv.mck.Query(-1)
+		kv.mu.Unlock()
 
 		time.Sleep(CONFIG_FETCH_INTERVAL)	
 	}
